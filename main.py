@@ -1,4 +1,5 @@
 # Standard library imports
+import olfactometer
 import os
 import json
 import logging
@@ -24,7 +25,7 @@ import seaborn as sns
 # GUI
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
-import tkinter as tk             
+import tkinter as tk
 
 # ----------------------------- CONFIG -----------------------------
 MODEL_PATH = "models/YoloV8n_mouse.pt"    # Path to YOLOv8 model file
@@ -32,6 +33,8 @@ HEATMAP_SIGMA = 20                        # Gaussian sigma for heatmap smoothing
 SMOOTH_WINDOW = 11                        # Savitzky-Golay window length
 SMOOTH_POLYORDER = 3                      # Savitzky-Golay polynomial order
 OUTPUT_DIR = "OFT_Results"                # Output folder
+CENTER_MODE = "full"                      # "full"  = whole arena polygon is the center zone
+                                          # "inner" = central 2x2 cells of a 4x4 grid (classic OFT)
 LOGFILE = os.path.join(OUTPUT_DIR, "oft_run.log")
 # ------------------------------------------------------------------
 
@@ -310,10 +313,13 @@ class MainApp(ctk.CTk):
         heatmap = np.zeros((frame_h, frame_w), dtype=np.float32)
         traj = []
         prev = None
+        prev_in_center = False
         total_px_dist = 0.0
         frame_idx = 0
 
-        # Precompute center zones (4x4 grid, central 2x2 is "center")
+        # Precompute the "center" region.
+        #   CENTER_MODE "full"  -> the whole arena polygon is the center
+        #   CENTER_MODE "inner" -> central 2x2 cells of a 4x4 grid (classic OFT)
         w = x_max - x_min
         h = y_max - y_min
         cell_w, cell_h = w // 4, h // 4
@@ -325,6 +331,17 @@ class MainApp(ctk.CTk):
                 zy1 = y_min + r * cell_h
                 center_zones.append((zx1, zy1, zx1 + cell_w, zy1 + cell_h))
                 center_centers.append((zx1 + cell_w // 2, zy1 + cell_h // 2))
+
+        # Binary mask of the center region -> used for every in/out test
+        region_u8 = np.zeros((frame_h, frame_w), dtype=np.uint8)
+        if CENTER_MODE == "full":
+            cv2.fillPoly(region_u8, [arena_np], 1)
+            center_centers = [(x_min + w // 2, y_min + h // 2)]
+        else:
+            for z in center_zones:
+                cv2.rectangle(region_u8, (z[0], z[1]), (z[2], z[3]), 1, -1)
+        center_mask = region_u8.astype(bool)
+        logging.info("Center region mode: %s", CENTER_MODE)
 
         # Reset to frame 0 if reading video
         if not is_camera:
@@ -356,8 +373,11 @@ class MainApp(ctk.CTk):
                 cv2.line(ann, (x_min, y_min + i * cell_h), (x_max, y_min + i * cell_h), (220, 220, 220), 1)
             # center highlight
             overlay = ann.copy()
-            for z in center_zones:
-                cv2.rectangle(overlay, (z[0], z[1]), (z[2], z[3]), (255, 255, 0), -1)
+            if CENTER_MODE == "full":
+                cv2.fillPoly(overlay, [arena_np], (255, 255, 0))
+            else:
+                for z in center_zones:
+                    cv2.rectangle(overlay, (z[0], z[1]), (z[2], z[3]), (255, 255, 0), -1)
             cv2.addWeighted(overlay, 0.18, ann, 0.82, 0, ann)
             for d in center_centers:
                 cv2.circle(ann, d, 6, (0, 0, 255), -1)
@@ -381,9 +401,24 @@ class MainApp(ctk.CTk):
 
             # If we have a center, compute metrics and append row
             if cx is not None and cy is not None:
+                # Clamp to image bounds for region lookup & heatmap indexing
+                ix = int(np.clip(round(cx), 0, frame_w - 1))
+                iy = int(np.clip(round(cy), 0, frame_h - 1))
+
                 # Determine zone: center vs border
-                in_center = any((cx >= z[0] and cx <= z[2] and cy >= z[1] and cy <= z[3]) for z in center_zones)
+                in_center = bool(center_mask[iy, ix])
                 zone = "Center" if in_center else "Border"
+
+                # Log the moment the mouse enters the center (rising edge only)
+                if in_center and not prev_in_center:
+                    logging.info("Mouse entered CENTER | frame=%d | t=%.3fs | pos=(%d, %d)",
+                                 frame_idx, frame_idx / fps, cx, cy)
+
+                    # Press the olfactometer "retry" button: the application
+                    # shows it when it lost the serial connection, and
+                    # clicking it makes the application reconnect.
+                    olfactometer.click_retry()
+                prev_in_center = in_center
 
                 # Distance & speed (pixels)
                 if prev is not None:
@@ -397,9 +432,6 @@ class MainApp(ctk.CTk):
                 prev = (cx, cy)
 
                 # Record heatmap & trajectory
-                # clamp to image bounds to avoid index errors
-                ix = np.clip(int(round(cx)), 0, frame_w - 1)
-                iy = np.clip(int(round(cy)), 0, frame_h - 1)
                 heatmap[iy, ix] += 1.0
                 traj.append((cx, cy))
 
@@ -490,10 +522,9 @@ class MainApp(ctk.CTk):
         path_length_cm = path_length_px * (1.0 / self.px_per_cm) if self.px_per_cm else None
 
         # Center occupancy & latency
-        df["In_Center"] = df.apply(
-            lambda r: any((r["X_px"] >= z[0] and r["X_px"] <= z[2] and r["Y_px"] >= z[1] and r["Y_px"] <= z[3]) for z in center_zones),
-            axis=1
-        )
+        ix_all = np.clip(df["X_px"].to_numpy(dtype=float).round().astype(int), 0, frame_w - 1)
+        iy_all = np.clip(df["Y_px"].to_numpy(dtype=float).round().astype(int), 0, frame_h - 1)
+        df["In_Center"] = center_mask[iy_all, ix_all]
         time_in_center_s = df["In_Center"].sum() / fps
         pct_time_center = (time_in_center_s / total_time_s * 100) if total_time_s else 0.0
 
@@ -516,7 +547,7 @@ class MainApp(ctk.CTk):
         pct_time_near_wall = (time_near_wall_s / total_time_s * 100) if total_time_s else 0.0
 
         # Center entries count (edge crossing)
-        center_entries = ((df["In_Center"]) & (~df["In_Center"].shift(1).fillna(False))).sum()
+        center_entries = ((df["In_Center"]) & (~df["In_Center"].shift(1, fill_value=False))).sum()
 
         # Save outputs
         logging.info("Saving per-frame CSV to %s", perframe_csv)
@@ -584,8 +615,12 @@ class MainApp(ctk.CTk):
             cv2.line(traj_img, (x_min + i * cell_w, y_min), (x_min + i * cell_w, y_max), (150, 150, 150), 1)
             cv2.line(traj_img, (x_min, y_min + i * cell_h), (x_max, y_min + i * cell_h), (150, 150, 150), 1)
         # center zones
-        for z in center_zones:
-            cv2.rectangle(traj_img, (z[0], z[1]), (z[2], z[3]), (0, 200, 200), -1)
+        if CENTER_MODE == "full":
+            cv2.fillPoly(traj_img, [arena_np], (0, 200, 200))
+            cv2.polylines(traj_img, [arena_np], isClosed=True, color=(255, 255, 255), thickness=2)
+        else:
+            for z in center_zones:
+                cv2.rectangle(traj_img, (z[0], z[1]), (z[2], z[3]), (0, 200, 200), -1)
         for d in center_centers:
             cv2.circle(traj_img, d, 6, (0, 0, 255), -1)
 

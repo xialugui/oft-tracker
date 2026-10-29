@@ -101,6 +101,47 @@ Data collected:
 - Thigmotaxis (time near walls)
 
 ----------------------------------------------------------------
+OLFACTOOMETER (RWD) INTEGRATION
+----------------------------------------------------------------
+
+When the mouse enters the center zone, the tracker can start the program
+of a connected RWD Olfactometer channel.
+
+Configuration (top of main.py):
+
+    OLFACTOOMETER_TRIGGER = True      # enable the trigger
+    OLFACTOOMETER_COOLDOWN_S = 5.0    # min seconds between two triggers
+
+Requirements:
+
+    - The RWD Olfactometer software (Olfactometer.exe) must be running
+      with a channel connected (e.g. COM5 / CH1).
+    - A program must be selected in the channel panel.
+    - The trigger drives the application's own start button through
+      Windows UI Automation (pywinauto); it does not talk to the
+      serial port directly.
+
+The start button carries no AutomationId, so it is located relative to
+the neighbouring "btnStop" button; this keeps working when the
+Olfactometer window is moved, resized or the display scaling changes.
+
+When the Olfactometer cannot detect a channel it shows a device-check
+dialog with a "重试" (retry) button. On every center entry the tracker
+looks for that button (it is found by its label, so the neighbouring
+"关闭软件" close-software button is never pressed) and clicks it,
+which makes the application retry the serial connection before the program
+is started.
+
+Every start is confirmed against the application's Program log:
+
+    C:\Program Files (x86)\RWD\Olfactometer\Log\Info\<YYYYMM>        Program_<YYYYMMDD>.txt
+
+If the channel is still busy, the trigger waits for it to go idle and
+skips the request instead of double-starting a program. If the
+olfactometer is not running, the trial continues and the failure is
+only written to the log.
+
+----------------------------------------------------------------
 OUTPUT FILES (IN OFT_Results/)
 ----------------------------------------------------------------
 
